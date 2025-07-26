@@ -76,9 +76,14 @@ exports.generateQuiz = async (req, res) => {
     
     for (const item of generatedQuiz) {
       const questionResult = await db.query(
-        'INSERT INTO questions (quiz_id, question_text, correct_answer, explanation) VALUES ($1, $2, $3, $4) RETURNING id',
-        [quizId, item.question, item.correctAnswer, item.explanation || "No explanation provided."]
-      );
+  'INSERT INTO questions (quiz_id, question_text, correct_answer, explanation) VALUES ($1, $2, $3, $4) RETURNING id',
+  [
+    quizId,
+    item.question,
+    item.correctAnswer || '',
+    item.explanation || "This answer is based on the PDF content."
+  ]
+);
       
       const questionId = questionResult.rows[0].id;
       
@@ -447,15 +452,14 @@ exports.generatePDFQuiz = async (req, res) => {
     
     for (const item of quizData.questions) {
       const questionResult = await db.query(
-        'INSERT INTO questions (quiz_id, question_text, correct_answer, explanation, type) VALUES ($1, $2, $3, $4, $5) RETURNING id',
-        [
-          quizId,
-          item.question,
-          item.correctAnswer || '',
-          item.explanation || "This answer is based on the PDF content.",
-          questionType
-        ]
-      );
+  'INSERT INTO questions (quiz_id, question_text, correct_answer, explanation) VALUES ($1, $2, $3, $4) RETURNING id',
+  [
+    quizId,
+    item.question,
+    item.correctAnswer || '',
+    item.explanation || "This answer is based on the PDF content."
+  ]
+);
     
       const questionId = questionResult.rows[0].id;
     
