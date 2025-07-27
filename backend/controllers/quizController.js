@@ -1,14 +1,14 @@
 const db = require('../config/db');
+
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 require('dotenv').config();
-
 const { extractTextFromPDF, generateQuizFromPDF } = require('../utils/pdfProcessor');
 const path = require('path');
 const fs = require('fs'); 
-
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 exports.generateQuiz = async (req, res) => {
+ 
   console.log(1);
   const { topic, difficulty = 'medium', numQuestions = 3 } = req.body;
   const userId = req.user.id;
@@ -23,7 +23,7 @@ exports.generateQuiz = async (req, res) => {
     try {
       console.log(`Generating quiz on ${topic} with ${numQuestions} questions using Gemini AI`);
       
-      const model = genAI.getGenerativeModel({ model: "gemini-pro" });
+      const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
       
       const prompt = `Generate a ${difficulty} quiz with ${numQuestions} multiple choice questions about ${topic}. 
       Each question should have 4 options with only one correct answer.
@@ -58,11 +58,13 @@ exports.generateQuiz = async (req, res) => {
       }
       if (generatedQuiz.length !== numQuestions) {
           console.warn(`AI generated ${generatedQuiz.length} questions, but ${numQuestions} were requested.`);
+          
       }
       
       console.log('Quiz generation successful');
     } catch (aiError) {
       console.error('Gemini AI generation error:', aiError);
+      
       console.log('Gemini API failed, using hardcoded fallback questions');
       generatedQuiz = generateFallbackQuiz(topic, difficulty, numQuestions);
     }
@@ -76,14 +78,9 @@ exports.generateQuiz = async (req, res) => {
     
     for (const item of generatedQuiz) {
       const questionResult = await db.query(
-  'INSERT INTO questions (quiz_id, question_text, correct_answer, explanation) VALUES ($1, $2, $3, $4) RETURNING id',
-  [
-    quizId,
-    item.question,
-    item.correctAnswer || '',
-    item.explanation || "This answer is based on the PDF content."
-  ]
-);
+        'INSERT INTO questions (quiz_id, question_text, correct_answer, explanation) VALUES ($1, $2, $3, $4) RETURNING id',
+        [quizId, item.question, item.correctAnswer, item.explanation || "No explanation provided."]
+      );
       
       const questionId = questionResult.rows[0].id;
       
@@ -116,6 +113,7 @@ exports.generateQuiz = async (req, res) => {
 };
 
 function generateFallbackQuiz(topic, difficulty, numQuestions) {
+ 
   console.log(`Generating fallback quiz on ${topic} with up to ${numQuestions} questions`);
   
   const fallbackQuizzes = {
@@ -206,8 +204,6 @@ exports.getQuiz = async (req, res) => {
     if (quizCheck.rows.length === 0) {
       return res.status(404).json({ message: 'Quiz not found or unauthorized' });
     }
-
-    // Get quiz questions
     const questionsResult = await db.query(
       'SELECT q.id, q.question_text FROM questions q WHERE q.quiz_id = $1',
       [id]
@@ -246,10 +242,11 @@ exports.getQuiz = async (req, res) => {
 
 exports.submitQuiz = async (req, res) => {
   const { id } = req.params;
-  const { answers, timeSpent } = req.body;
+  const { answers, timeSpent, questionType } = req.body;
   const userId = req.user.id;
 
   try {
+   
     const quizCheck = await db.query(
       'SELECT * FROM quizzes WHERE id = $1 AND user_id = $2',
       [id, userId]
@@ -259,50 +256,148 @@ exports.submitQuiz = async (req, res) => {
       return res.status(404).json({ message: 'Quiz not found or unauthorized' });
     }
 
-    let score = 0;
-    const answerResults = [];
-
-    for (const answer of answers) {
-      const { questionId, selectedOptionId } = answer;
+    if (questionType === 'Subjective') {
       
-      const optionCheck = await db.query(
-        'SELECT is_correct FROM options WHERE id = $1 AND question_id = $2',
-        [selectedOptionId, questionId]
+      const totalQuestions = answers.length;
+      let totalScore = 0;
+      const gradingResults = [];
+
+      const resultInsert = await db.query(
+        'INSERT INTO quiz_results (quiz_id, user_id, score, total_questions, time_taken) VALUES ($1, $2, $3, $4, $5) RETURNING id',
+        [id, userId, 0, totalQuestions, timeSpent]
       );
+      const resultId = resultInsert.rows[0].id;
 
-      if (optionCheck.rows.length > 0) {
-        const isCorrect = optionCheck.rows[0].is_correct;
-        if (isCorrect) score++;
-        answerResults.push({ questionId, selectedOptionId, isCorrect });
+      for (const answer of answers) {
+       
+        const questionRow = await db.query(
+          'SELECT question_text, correct_answer FROM questions WHERE id = $1',
+          [answer.questionId]
+        );
+        const questionData = questionRow.rows[0];
+        const correctAnswer = questionData?.correct_answer || '';
+        const userAnswer = answer.answer || '';
+
+        const prompt = `
+You are an advanced quiz grader. Your task is to compare the student's answer with the correct answer and provide a percentage score (0-100) indicating how correct the student's answer is. Also, provide a brief explanation, addressing the user as 'student', of why you assigned that score. Consider the following scoring guide:
+
+- 100%: The student's answer is completely correct and matches the meaning of the correct answer perfectly.
+- 75-99%: The student's answer is mostly correct but has minor flaws or omissions.
+- 50-74%: The student's answer is partially correct but misses significant aspects of the correct answer.
+- 25-49%: The student's answer contains some relevant information but is largely incorrect.
+- 0-24%: The student's answer is completely incorrect or irrelevant.
+
+Focus on the core meaning and key details. Provide the percentage and justification in the 'score' and 'reason' fields respectively. Address the user as 'student' in the 'reason' field.
+
+Correct answer: """${correctAnswer}"""
+Student answer: """${userAnswer}"""
+
+Respond ONLY in valid JSON: { "score": <number>, "reason": "<string>" }
+`;
+
+        let score = 0;
+        let reason = '';
+        try {
+          const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+          const result = await model.generateContent(prompt);
+          const response = await result.response;
+          let text = response.text().trim();
+
+          let jsonStart = text.indexOf('{');
+          let jsonEnd = text.lastIndexOf('}');
+          let jsonString = (jsonStart !== -1 && jsonEnd !== -1) ? text.substring(jsonStart, jsonEnd + 1) : null;
+
+          let parsed;
+          if (jsonString) {
+            parsed = JSON.parse(jsonString);
+          } else {
+            throw new Error("No JSON found in Gemini response");
+          }
+
+          if (parsed && typeof parsed.score === 'number') {
+            score = parsed.score;
+            reason = parsed.reason || '';
+          } else {
+            throw new Error("No score in Gemini response");
+          }
+        } catch (err) {
+          console.log('Gemini grading error:', err, 'Prompt:', prompt);
+          score = 0;
+          reason = 'AI auto-grading failed. Please review manually.';
+        }
+
+        totalScore += (score / answers.length);
+
+        await db.query(
+          'INSERT INTO user_answers (quiz_result_id, question_id, selected_option_id, is_correct, subjective_answer, subjective_score, subjective_reason) VALUES ($1, $2, NULL, $3, $4, $5, $6)',
+          [resultId, answer.questionId, score >= 50, userAnswer, score, reason]
+        );
+        gradingResults.push({
+          questionId: answer.questionId,
+          score,
+          reason
+        });
       }
-    }
 
-    const totalQuestions = answers.length;
-    
-    const resultInsert = await db.query(
-      'INSERT INTO quiz_results (quiz_id, user_id, score, total_questions, time_taken) VALUES ($1, $2, $3, $4, $5) RETURNING id',
-      [id, userId, score, totalQuestions, timeSpent]
-    );
-    
-    const resultId = resultInsert.rows[0].id;
-
-    for (const result of answerResults) {
+      const avgScore = totalQuestions > 0 ? totalScore : 0;
       await db.query(
-        'INSERT INTO user_answers (quiz_result_id, question_id, selected_option_id, is_correct) VALUES ($1, $2, $3, $4)',
-        [resultId, result.questionId, result.selectedOptionId, result.isCorrect]
+        'UPDATE quiz_results SET score = $1 WHERE id = $2',
+        [Math.round(avgScore), resultId]
       );
-    }
 
-    res.json({
-      status: 'success',
-      data: {
-        quizId: parseInt(id),
-        score,
-        totalQuestions,
-        percentage: (score / totalQuestions) * 100,
-        resultId
+      return res.json({
+        status: 'success',
+        data: {
+          quizId: parseInt(id),
+          score: Math.round(avgScore),
+          totalQuestions,
+          percentage: avgScore,
+          resultId,
+          grading: gradingResults
+        }
+      });
+    } else {
+      let score = 0;
+      const answerResults = [];
+
+      for (const answer of answers) {
+        const { questionId, selectedOptionId } = answer;
+        const optionCheck = await db.query(
+          'SELECT is_correct FROM options WHERE id = $1 AND question_id = $2',
+          [selectedOptionId, questionId]
+        );
+        if (optionCheck.rows.length > 0) {
+          const isCorrect = optionCheck.rows[0].is_correct;
+          if (isCorrect) score++;
+          answerResults.push({ questionId, selectedOptionId, isCorrect });
+        }
       }
-    });
+
+      const totalQuestions = answers.length;
+      const resultInsert = await db.query(
+        'INSERT INTO quiz_results (quiz_id, user_id, score, total_questions, time_taken) VALUES ($1, $2, $3, $4, $5) RETURNING id',
+        [id, userId, score, totalQuestions, timeSpent]
+      );
+      const resultId = resultInsert.rows[0].id;
+
+      for (const result of answerResults) {
+        await db.query(
+          'INSERT INTO user_answers (quiz_result_id, question_id, selected_option_id, is_correct) VALUES ($1, $2, $3, $4)',
+          [resultId, result.questionId, result.selectedOptionId, result.isCorrect]
+        );
+      }
+
+      return res.json({
+        status: 'success',
+        data: {
+          quizId: parseInt(id),
+          score,
+          totalQuestions,
+          percentage: (score / totalQuestions) * 100,
+          resultId
+        }
+      });
+    }
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Server error' });
@@ -314,12 +409,20 @@ exports.getQuizHistory = async (req, res) => {
 
   try {
     const history = await db.query(
-      `SELECT q.id, q.topic, q.difficulty, q.created_at, 
-       r.score, r.total_questions, r.completed_at, r.time_taken
-       FROM quizzes q
-       LEFT JOIN quiz_results r ON q.id = r.quiz_id
-       WHERE q.user_id = $1
-       ORDER BY q.created_at DESC`,
+      `SELECT 
+         r.id as result_id,
+         r.quiz_id,
+         q.topic,
+         q.difficulty,
+         q.source_type,
+         r.score,
+         r.total_questions,
+         r.completed_at,
+         r.time_taken
+       FROM quiz_results r
+       JOIN quizzes q ON r.quiz_id = q.id
+       WHERE r.user_id = $1
+       ORDER BY r.completed_at DESC`,
       [userId]
     );
 
@@ -355,9 +458,10 @@ exports.getQuizResults = async (req, res) => {
     const detailQuery = await db.query(
       `SELECT q.id as question_id, q.question_text, q.explanation,
        o.id as option_id, o.option_text, o.is_correct,
-       ua.is_correct as user_correct, ua.selected_option_id
+       ua.is_correct as user_correct, ua.selected_option_id,
+       ua.subjective_answer, ua.subjective_score, ua.subjective_reason
        FROM questions q
-       JOIN options o ON q.id = o.question_id
+       LEFT JOIN options o ON q.id = o.question_id
        LEFT JOIN user_answers ua ON q.id = ua.question_id AND ua.quiz_result_id = $1
        WHERE q.quiz_id = $2`,
       [result.id, id]
@@ -369,18 +473,22 @@ exports.getQuizResults = async (req, res) => {
         questions[row.question_id] = {
           id: row.question_id,
           question: row.question_text,
-          explanation: row.explanation, 
+          explanation: row.explanation,
           options: [],
           userAnswer: row.selected_option_id,
-          correct: row.user_correct
+          correct: row.user_correct,
+          subjectiveAnswer: row.subjective_answer,
+          subjectiveScore: row.subjective_score,
+          subjectiveReason: row.subjective_reason
         };
       }
-      
-      questions[row.question_id].options.push({
-        id: row.option_id,
-        text: row.option_text,
-        isCorrect: row.is_correct
-      });
+      if (row.option_id) {
+        questions[row.question_id].options.push({
+          id: row.option_id,
+          text: row.option_text,
+          isCorrect: row.is_correct
+        });
+      }
     });
 
     const score = result.score;
@@ -419,7 +527,7 @@ exports.getQuizResults = async (req, res) => {
 
 exports.generatePDFQuiz = async (req, res) => {
   const userId = req.user.id;
-  const { topic, difficulty = 'medium', numQuestions = 5, questionType = 'mcq' } = req.body;
+  const { topic, difficulty = 'medium', numQuestions = 5 , questionType} = req.body;
   
   if (!req.file) {
     return res.status(400).json({ message: 'PDF file is required' });
@@ -427,6 +535,10 @@ exports.generatePDFQuiz = async (req, res) => {
   
   if (!topic) {
     return res.status(400).json({ message: 'Topic is required' });
+  }
+
+  if (!questionType) {
+    return res.status(400).json({ message: 'Question Type is required' });
   }
   
   try {
@@ -440,8 +552,9 @@ exports.generatePDFQuiz = async (req, res) => {
       throw new Error('PDF content is too short or could not be properly extracted');
     }
     
+    
     console.log(`Generating quiz from PDF content on topic: ${topic}`);
-    const quizData = await generateQuizFromPDF(pdfText, topic, difficulty, numQuestions, questionType);
+    const quizData = await generateQuizFromPDF(pdfText, topic, difficulty, numQuestions , questionType);
     
     const quizResult = await db.query(
       'INSERT INTO quizzes (user_id, topic, difficulty, description, source_type, source_file_path) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
@@ -451,33 +564,25 @@ exports.generatePDFQuiz = async (req, res) => {
     const quizId = quizResult.rows[0].id;
     
     for (const item of quizData.questions) {
+     
+      const isSubjective = questionType === 'Subjective';
+      const correctAnswer = isSubjective ? (item.explanation || '') : (item.correctAnswer || '');
+      const options = Array.isArray(item.options) ? item.options : [];
+
       const questionResult = await db.query(
-  'INSERT INTO questions (quiz_id, question_text, correct_answer, explanation) VALUES ($1, $2, $3, $4) RETURNING id',
-  [
-    quizId,
-    item.question,
-    item.correctAnswer || '',
-    item.explanation || "This answer is based on the PDF content."
-  ]
-);
-    
+        'INSERT INTO questions (quiz_id, question_text, correct_answer, explanation) VALUES ($1, $2, $3, $4) RETURNING id',
+        [quizId, item.question, correctAnswer, item.explanation || "This answer is based on the PDF content."]
+      );
       const questionId = questionResult.rows[0].id;
-    
-      if (questionType === 'mcq') {
-        for (const option of item.options) {
+
+      if (!isSubjective && options.length > 0) {
+        for (const option of options) {
           await db.query(
             'INSERT INTO options (question_id, option_text, is_correct) VALUES ($1, $2, $3)',
             [questionId, option, option === item.correctAnswer]
           );
         }
       }
-    }
-    
-    try {
-      fs.unlinkSync(filePath);
-      console.log(`Deleted uploaded PDF: ${filePath}`);
-    } catch (deleteErr) {
-      console.error(`Failed to delete uploaded PDF: ${filePath}`, deleteErr);
     }
     
     res.status(201).json({
